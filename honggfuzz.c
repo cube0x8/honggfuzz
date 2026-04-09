@@ -468,6 +468,23 @@ int main(int argc, char** argv) {
                 "crashes, unique_crashes, hangs, edge_cov, block_cov, corpus_count\n");
         }
     }
+#if defined(_HF_ARCH_LINUX)
+    if (hfuzz.arch_linux.btsModuleStatsFile) {
+        hfuzz.arch_linux.btsModuleStatsFd = TEMP_FAILURE_RETRY(open(
+            hfuzz.arch_linux.btsModuleStatsFile, O_CREAT | O_RDWR | O_TRUNC | O_APPEND, 0640));
+
+        if (hfuzz.arch_linux.btsModuleStatsFd == -1) {
+            PLOG_F("Couldn't open BTS module stats file open('%s')",
+                hfuzz.arch_linux.btsModuleStatsFile);
+        } else {
+            dprintf(hfuzz.arch_linux.btsModuleStatsFd,
+                "# honggfuzz BTS module stats\n"
+                "# snapshot unix_time=<epoch> total_module_edges=<count> total_discarded=<count>"
+                " discarded_unknown=<count> modules=<count>\n"
+                "# module name=<module> allowed=<0|1> accepted=<count> discarded=<count>\n");
+        }
+    }
+#endif
 
     setupRLimits();
     setupSignalsPreThreads();
@@ -506,6 +523,11 @@ int main(int argc, char** argv) {
     if (hfuzz.io.statsFileName) {
         close(hfuzz.io.statsFileFd);
     }
+#if defined(_HF_ARCH_LINUX)
+    if (hfuzz.arch_linux.btsModuleStatsFd != -1) {
+        close(hfuzz.arch_linux.btsModuleStatsFd);
+    }
+#endif
 
     printSummary(&hfuzz);
 

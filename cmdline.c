@@ -190,6 +190,11 @@ static void cmdlineHelp(const char* pname, struct custom_option* opts) {
     LOG_HELP_BOLD(
         "  " PROG_NAME
         " --linux_perf_bts_edge --modules cevakrnl.xmd,ceva_emu.cvd -- /path/to/target");
+    LOG_HELP(" As above, but also write periodic per-module BTS stats to a tail-able file:");
+    LOG_HELP_BOLD("  " PROG_NAME
+                  " --linux_perf_bts_edge --modules cevakrnl.xmd,ceva_emu.cvd"
+                  " --linux_perf_module_stats /tmp/hf-modules.log"
+                  " --linux_perf_module_stats_interval 10 -- /path/to/target");
     LOG_HELP(
         " As above, maximize unique code blocks via Intel Processor Trace (requires libipt.so):");
     LOG_HELP_BOLD("  " PROG_NAME " --linux_perf_ipt_block -- /usr/bin/djpeg " _HF_FILE_PLACEHOLDER);
@@ -519,6 +524,11 @@ bool cmdlineParse(int argc, char* argv[], honggfuzz_t* hfuzz) {
                 .symsWlFile           = NULL,
                 .symsWlCnt            = 0,
                 .symsWl               = NULL,
+                .btsModuleStatsFile   = NULL,
+                .btsModuleStatsInterval = 30,
+                .btsModuleStatsFd     = -1,
+                .btsModuleStatsLastWrite = 0,
+                .btsModuleStatsCnt    = 0,
                 .cloneFlags           = 0,
                 .useNetNs             = HF_NO,
                 .kernelOnly           = false,
@@ -610,6 +620,8 @@ bool cmdlineParse(int argc, char* argv[], honggfuzz_t* hfuzz) {
         { { "linux_perf_bts_edge", no_argument, NULL, 0x513 }, "Use Intel BTS to count unique edges" },
         { { "linux_perf_modules", required_argument, NULL, 0x516 }, "Comma-separated module allowlist for Intel BTS novelty filtering" },
         { { "modules", required_argument, NULL, 0x516 }, "Comma-separated module allowlist for Intel BTS novelty filtering" },
+        { { "linux_perf_module_stats", required_argument, NULL, 0x517 }, "Write periodic BTS per-module edge/discard stats to this file" },
+        { { "linux_perf_module_stats_interval", required_argument, NULL, 0x518 }, "Seconds between BTS per-module stats snapshots (default: 30)" },
         { { "linux_perf_ipt_block", no_argument, NULL, 0x514 }, "Use Intel Processor Trace to count unique blocks (requires libipt.so)" },
         { { "linux_perf_kernel_only", no_argument, NULL, 0x515 }, "Gather kernel-only coverage with Intel PT and with Intel BTS" },
         { { "linux_ns_net", required_argument, NULL, 0x0530 }, "Use Linux NET namespace isolation (yes/no/maybe [default:no])" },
@@ -852,6 +864,16 @@ bool cmdlineParse(int argc, char* argv[], honggfuzz_t* hfuzz) {
                 return false;
             }
             break;
+        case 0x517:
+            hfuzz->arch_linux.btsModuleStatsFile = optarg;
+            break;
+        case 0x518:
+            if (!util_isANumber(optarg)) {
+                LOG_E("'%s' is not a valid value for --linux_perf_module_stats_interval", optarg);
+                return false;
+            }
+            hfuzz->arch_linux.btsModuleStatsInterval = strtoull(optarg, NULL, 0);
+            break;
         case 0x514:
             hfuzz->feedback.dynFileMethod |= _HF_DYNFILE_IPT_BLOCK;
             break;
@@ -915,6 +937,10 @@ bool cmdlineParse(int argc, char* argv[], honggfuzz_t* hfuzz) {
     if (hfuzz->arch_linux.btsModuleNamesCnt > 0 &&
         !(hfuzz->feedback.dynFileMethod & _HF_DYNFILE_BTS_EDGE)) {
         LOG_W("--modules has effect only together with --linux_perf_bts_edge");
+    }
+    if (hfuzz->arch_linux.btsModuleStatsFile &&
+        !(hfuzz->feedback.dynFileMethod & _HF_DYNFILE_BTS_EDGE)) {
+        LOG_W("--linux_perf_module_stats has effect only together with --linux_perf_bts_edge");
     }
     if (!cmdlineVerify(hfuzz)) {
         return false;

@@ -213,6 +213,10 @@ Options:
 	Use PERF_COUNT_HW_BRANCH_INSTRUCTIONS perf
  --linux_perf_bts_edge 
 	Use Intel BTS to count unique edges
+ --linux_perf_module_stats VALUE
+	Write periodic BTS per-module edge/discard stats to this file
+ --linux_perf_module_stats_interval VALUE
+	Seconds between BTS per-module stats snapshots (default: 30)
  --linux_perf_ipt_block 
 	Use Intel Processor Trace to count unique blocks (requires libipt.so)
  --linux_perf_kernel_only 

@@ -57,6 +57,14 @@ static inline bool arch_perfBtsModuleFilterEnabled(const run_t* run) {
     return run->global->arch_linux.btsModuleNamesCnt != 0U;
 }
 
+static inline bool arch_perfBtsModuleStatsEnabled(const run_t* run) {
+    return run->global->arch_linux.btsModuleStatsFd != -1;
+}
+
+static inline bool arch_perfBtsModuleTrackingEnabled(const run_t* run) {
+    return arch_perfBtsModuleFilterEnabled(run) || arch_perfBtsModuleStatsEnabled(run);
+}
+
 static bool arch_perfBtsOpenModulesShm(run_t* run) {
     if (run->arch_linux.btsModuleShm != NULL) {
         return true;
@@ -97,7 +105,7 @@ static bool arch_perfBtsOpenModulesShm(run_t* run) {
 }
 
 static void arch_perfBtsRefreshModulesFilter(run_t* run) {
-    if (!arch_perfBtsModuleFilterEnabled(run)) {
+    if (!arch_perfBtsModuleTrackingEnabled(run)) {
         return;
     }
     if (!arch_perfBtsOpenModulesShm(run)) {
@@ -127,30 +135,59 @@ static void arch_perfBtsRefreshModulesFilter(run_t* run) {
         return;
     }
 
-    run->arch_linux.btsModuleRangeCnt = 0;
+    if (arch_perfBtsModuleStatsEnabled(run)) {
+        MX_SCOPED_LOCK(&run->global->mutex.feedback);
+        run->global->arch_linux.btsModuleStatsCnt = entryCnt;
+    }
+
+    run->arch_linux.btsLoadedModuleCnt = entryCnt;
+    run->arch_linux.btsModuleRangeCnt  = 0;
     for (size_t entryIdx = 0; entryIdx < entryCnt; entryIdx++) {
+        bool allowed = !arch_perfBtsModuleFilterEnabled(run);
+
         for (size_t modIdx = 0; modIdx < run->global->arch_linux.btsModuleNamesCnt; modIdx++) {
             if (strcmp(shm->entries[entryIdx].name, run->global->arch_linux.btsModuleNames[modIdx]) !=
                 0) {
                 continue;
             }
             matched[modIdx] = true;
-            if (run->arch_linux.btsModuleRangeCnt >= ARRAYSIZE(run->arch_linux.btsModuleRanges)) {
-                if (!run->arch_linux.btsModuleFilterWarned) {
-                    LOG_W("Too many BTS module ranges for pid=%d, truncating to %u entries",
-                        (int)run->pid, _HF_BTS_MODULE_FILTER_MAX);
-                    run->arch_linux.btsModuleFilterWarned = true;
-                }
-                break;
-            }
-
-            run->arch_linux.btsModuleRanges[run->arch_linux.btsModuleRangeCnt].start =
-                shm->entries[entryIdx].start;
-            run->arch_linux.btsModuleRanges[run->arch_linux.btsModuleRangeCnt].end =
-                shm->entries[entryIdx].end;
-            run->arch_linux.btsModuleRangeCnt++;
+            allowed         = true;
             break;
         }
+
+        run->arch_linux.btsLoadedModules[entryIdx].start     = shm->entries[entryIdx].start;
+        run->arch_linux.btsLoadedModules[entryIdx].end       = shm->entries[entryIdx].end;
+        run->arch_linux.btsLoadedModules[entryIdx].statsSlot = (int32_t)entryIdx;
+        run->arch_linux.btsLoadedModules[entryIdx].allowed   = allowed;
+        snprintf(run->arch_linux.btsLoadedModules[entryIdx].name,
+            sizeof(run->arch_linux.btsLoadedModules[entryIdx].name), "%s",
+            shm->entries[entryIdx].name);
+
+        if (arch_perfBtsModuleStatsEnabled(run)) {
+            MX_SCOPED_LOCK(&run->global->mutex.feedback);
+            snprintf(run->global->arch_linux.btsModuleStatsNames[entryIdx],
+                sizeof(run->global->arch_linux.btsModuleStatsNames[entryIdx]), "%s",
+                shm->entries[entryIdx].name);
+            run->global->arch_linux.btsModuleStatsAllowed[entryIdx] = allowed ? 1U : 0U;
+        }
+
+        if (!allowed || !arch_perfBtsModuleFilterEnabled(run)) {
+            continue;
+        }
+        if (run->arch_linux.btsModuleRangeCnt >= ARRAYSIZE(run->arch_linux.btsModuleRanges)) {
+            if (!run->arch_linux.btsModuleFilterWarned) {
+                LOG_W("Too many BTS module ranges for pid=%d, truncating to %u entries",
+                    (int)run->pid, _HF_BTS_MODULE_FILTER_MAX);
+                run->arch_linux.btsModuleFilterWarned = true;
+            }
+            break;
+        }
+
+        run->arch_linux.btsModuleRanges[run->arch_linux.btsModuleRangeCnt].start =
+            shm->entries[entryIdx].start;
+        run->arch_linux.btsModuleRanges[run->arch_linux.btsModuleRangeCnt].end =
+            shm->entries[entryIdx].end;
+        run->arch_linux.btsModuleRangeCnt++;
     }
 
     for (size_t modIdx = 0; modIdx < run->global->arch_linux.btsModuleNamesCnt; modIdx++) {
@@ -160,10 +197,100 @@ static void arch_perfBtsRefreshModulesFilter(run_t* run) {
         }
     }
 
-    LOG_I("Loaded %zu BTS filter range(s) for pid=%d", run->arch_linux.btsModuleRangeCnt,
-        (int)run->pid);
-    run->arch_linux.btsModuleShmCount     = (uint32_t)entryCnt;
+    LOG_I("Loaded %zu BTS module(s) for pid=%d (%zu filter range(s))",
+        run->arch_linux.btsLoadedModuleCnt, (int)run->pid, run->arch_linux.btsModuleRangeCnt);
+    run->arch_linux.btsModuleShmCount    = (uint32_t)entryCnt;
     run->arch_linux.btsModuleFilterReady = true;
+}
+
+static inline int32_t arch_perfBtsFindModuleSlot(const run_t* run, uint64_t pc) {
+    for (size_t i = 0; i < run->arch_linux.btsLoadedModuleCnt; i++) {
+        if (pc >= run->arch_linux.btsLoadedModules[i].start &&
+            pc < run->arch_linux.btsLoadedModules[i].end) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
+static inline bool arch_perfBtsSlotAllowed(const run_t* run, int32_t slot) {
+    return slot >= 0 && run->arch_linux.btsLoadedModules[slot].allowed;
+}
+
+static void arch_perfBtsRecordEdgeStats(
+    run_t* run, int32_t fromSlot, int32_t toSlot, bool allowedEdge) {
+    if (!arch_perfBtsModuleStatsEnabled(run)) {
+        return;
+    }
+
+    bool touchedModule = false;
+    if (fromSlot >= 0) {
+        touchedModule = true;
+        if (allowedEdge) {
+            ATOMIC_PRE_INC(run->global->arch_linux.btsModuleAcceptedPerModule[fromSlot]);
+        } else {
+            ATOMIC_PRE_INC(run->global->arch_linux.btsModuleDiscardedPerModule[fromSlot]);
+        }
+    }
+    if (toSlot >= 0 && toSlot != fromSlot) {
+        touchedModule = true;
+        if (allowedEdge) {
+            ATOMIC_PRE_INC(run->global->arch_linux.btsModuleAcceptedPerModule[toSlot]);
+        } else {
+            ATOMIC_PRE_INC(run->global->arch_linux.btsModuleDiscardedPerModule[toSlot]);
+        }
+    }
+
+    if (allowedEdge) {
+        if (touchedModule) {
+            ATOMIC_PRE_INC(run->global->arch_linux.btsModuleAcceptedTotal);
+        }
+    } else {
+        ATOMIC_PRE_INC(run->global->arch_linux.btsModuleDiscardedTotal);
+        if (!touchedModule) {
+            ATOMIC_PRE_INC(run->global->arch_linux.btsModuleDiscardedUnknown);
+        }
+    }
+}
+
+static void arch_perfBtsMaybeWriteModuleStats(run_t* run) {
+    if (!arch_perfBtsModuleStatsEnabled(run)) {
+        return;
+    }
+
+    const time_t now = time(NULL);
+    time_t       lastWrite = ATOMIC_GET(run->global->arch_linux.btsModuleStatsLastWrite);
+    if ((uint64_t)(now - lastWrite) < run->global->arch_linux.btsModuleStatsInterval) {
+        return;
+    }
+    if (!__atomic_compare_exchange_n(&run->global->arch_linux.btsModuleStatsLastWrite, &lastWrite,
+            now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        return;
+    }
+
+    MX_SCOPED_LOCK(&run->global->mutex.feedback);
+
+    dprintf(run->global->arch_linux.btsModuleStatsFd,
+        "snapshot unix_time=%ld total_module_edges=%" PRIu64 " total_discarded=%" PRIu64
+        " discarded_unknown=%" PRIu64 " modules=%zu\n",
+        (long)now, ATOMIC_GET(run->global->arch_linux.btsModuleAcceptedTotal),
+        ATOMIC_GET(run->global->arch_linux.btsModuleDiscardedTotal),
+        ATOMIC_GET(run->global->arch_linux.btsModuleDiscardedUnknown),
+        ATOMIC_GET(run->global->arch_linux.btsModuleStatsCnt));
+
+    const size_t moduleCnt = ATOMIC_GET(run->global->arch_linux.btsModuleStatsCnt);
+    for (size_t i = 0; i < moduleCnt; i++) {
+        if (run->global->arch_linux.btsModuleStatsNames[i][0] == '\0') {
+            continue;
+        }
+        dprintf(run->global->arch_linux.btsModuleStatsFd,
+            "module name=%s allowed=%u accepted=%" PRIu64 " discarded=%" PRIu64 "\n",
+            run->global->arch_linux.btsModuleStatsNames[i],
+            (unsigned)ATOMIC_GET(run->global->arch_linux.btsModuleStatsAllowed[i]),
+            ATOMIC_GET(run->global->arch_linux.btsModuleAcceptedPerModule[i]),
+            ATOMIC_GET(run->global->arch_linux.btsModuleDiscardedPerModule[i]));
+    }
+    dprintf(run->global->arch_linux.btsModuleStatsFd, "\n");
 }
 
 static inline bool arch_perfBtsEdgeAllowed(const run_t* run, uint64_t from, uint64_t to) {
@@ -189,7 +316,7 @@ __attribute__((hot)) static inline void arch_perfBtsCount(run_t* run) {
 
     uint64_t           aux_head = ATOMIC_GET(pem->aux_head);
     struct bts_branch* br       = (struct bts_branch*)run->arch_linux.perfMmapAux;
-    if (arch_perfBtsModuleFilterEnabled(run)) {
+    if (arch_perfBtsModuleTrackingEnabled(run)) {
         arch_perfBtsRefreshModulesFilter(run);
     }
     for (; br < ((struct bts_branch*)(run->arch_linux.perfMmapAux + aux_head)); br++) {
@@ -207,10 +334,27 @@ __attribute__((hot)) static inline void arch_perfBtsCount(run_t* run) {
             br->to >= run->global->arch_linux.dynamicCutOffAddr) {
             continue;
         }
-        if (arch_perfBtsModuleFilterEnabled(run) &&
-            (!run->arch_linux.btsModuleFilterReady ||
-                !arch_perfBtsEdgeAllowed(run, br->from, br->to))) {
-            continue;
+
+        int32_t fromSlot = -1;
+        int32_t toSlot   = -1;
+        if (arch_perfBtsModuleStatsEnabled(run)) {
+            fromSlot = arch_perfBtsFindModuleSlot(run, br->from);
+            toSlot   = arch_perfBtsFindModuleSlot(run, br->to);
+        }
+
+        bool allowedEdge = true;
+        if (arch_perfBtsModuleFilterEnabled(run)) {
+            allowedEdge = run->arch_linux.btsModuleFilterReady &&
+                          (arch_perfBtsSlotAllowed(run, fromSlot) ||
+                              arch_perfBtsSlotAllowed(run, toSlot) ||
+                              (!arch_perfBtsModuleStatsEnabled(run) &&
+                                  arch_perfBtsEdgeAllowed(run, br->from, br->to)));
+            arch_perfBtsRecordEdgeStats(run, fromSlot, toSlot, allowedEdge);
+            if (!allowedEdge) {
+                continue;
+            }
+        } else if (arch_perfBtsModuleStatsEnabled(run)) {
+            arch_perfBtsRecordEdgeStats(run, fromSlot, toSlot, true);
         }
 
         register size_t pos = ((br->from << 12) ^ (br->to & 0xFFF));
@@ -221,6 +365,7 @@ __attribute__((hot)) static inline void arch_perfBtsCount(run_t* run) {
             run->hwCnts.newBBCnt++;
         }
     }
+    arch_perfBtsMaybeWriteModuleStats(run);
 }
 #endif /* defined(PERF_ATTR_SIZE_VER5) */
 
@@ -411,6 +556,7 @@ void arch_perfClose(run_t* run) {
         run->arch_linux.btsModuleShmFd = -1;
     }
     run->arch_linux.btsModuleShmCount        = 0;
+    run->arch_linux.btsLoadedModuleCnt       = 0;
     run->arch_linux.btsModuleRangeCnt        = 0;
     run->arch_linux.btsModuleFilterReady     = false;
     run->arch_linux.btsModuleFilterWarned    = false;

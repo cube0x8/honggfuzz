@@ -36,6 +36,7 @@
 #include <sys/types.h>
 #include <time.h>
 
+#include "linux/bts_modules.h"
 #include "libhfcommon/util.h"
 
 #define PROG_NAME    "honggfuzz"
@@ -226,6 +227,14 @@ typedef struct {
 } hf_bts_module_range_t;
 
 typedef struct {
+    uint64_t start;
+    uint64_t end;
+    int32_t  statsSlot;
+    bool     allowed;
+    char     name[HF_BTS_MODULES_NAME_MAX];
+} hf_bts_loaded_module_t;
+
+typedef struct {
     uint8_t  val[64];
     uint32_t len;
 } dict_entry_t;
@@ -391,6 +400,18 @@ typedef struct {
         size_t      symsWlCnt;
         size_t      btsModuleNamesCnt;
         char        btsModuleNames[_HF_BTS_MODULE_FILTER_MAX][_HF_BTS_MODULE_NAME_MAX];
+        const char* btsModuleStatsFile;
+        uint64_t    btsModuleStatsInterval;
+        int         btsModuleStatsFd;
+        time_t      btsModuleStatsLastWrite;
+        size_t      btsModuleStatsCnt;
+        char        btsModuleStatsNames[HF_BTS_MODULES_SHM_MAX_ENTRIES][HF_BTS_MODULES_NAME_MAX];
+        uint8_t     btsModuleStatsAllowed[HF_BTS_MODULES_SHM_MAX_ENTRIES];
+        uint64_t    btsModuleAcceptedPerModule[HF_BTS_MODULES_SHM_MAX_ENTRIES];
+        uint64_t    btsModuleDiscardedPerModule[HF_BTS_MODULES_SHM_MAX_ENTRIES];
+        uint64_t    btsModuleAcceptedTotal;
+        uint64_t    btsModuleDiscardedTotal;
+        uint64_t    btsModuleDiscardedUnknown;
         uintptr_t   cloneFlags;
         tristate_t  useNetNs;
         bool        kernelOnly;
@@ -450,6 +471,8 @@ typedef struct {
         void*    btsModuleShm;
         int      btsModuleShmFd;
         uint32_t btsModuleShmCount;
+        size_t   btsLoadedModuleCnt;
+        hf_bts_loaded_module_t btsLoadedModules[HF_BTS_MODULES_SHM_MAX_ENTRIES];
         size_t   btsModuleRangeCnt;
         hf_bts_module_range_t btsModuleRanges[_HF_BTS_MODULE_FILTER_MAX];
         bool     btsModuleFilterReady;
