@@ -68,6 +68,8 @@
 /* Perf bitmap size */
 #define _HF_PERF_BITMAP_SIZE_16M   (1024U * 1024U * 16U)
 #define _HF_PERF_BITMAP_BITSZ_MASK 0x7FFFFFFULL
+#define _HF_BTS_MODULE_FILTER_MAX  128U
+#define _HF_BTS_MODULE_NAME_MAX    64U
 /* Maximum number of PC guards (=trace-pc-guard) we support */
 #define _HF_PC_GUARD_MAX (1024ULL * 1024ULL * 64ULL)
 
@@ -217,6 +219,11 @@ typedef struct {
     /* Global edge frequency tracking - indexed by (guard % size) */
     uint8_t edgeHitCnt[65536];
 } feedback_t;
+
+typedef struct {
+    uint64_t start;
+    uint64_t end;
+} hf_bts_module_range_t;
 
 typedef struct {
     uint8_t  val[64];
@@ -382,6 +389,8 @@ typedef struct {
         const char* symsWlFile;
         char**      symsWl;
         size_t      symsWlCnt;
+        size_t      btsModuleNamesCnt;
+        char        btsModuleNames[_HF_BTS_MODULE_FILTER_MAX][_HF_BTS_MODULE_NAME_MAX];
         uintptr_t   cloneFlags;
         tristate_t  useNetNs;
         bool        kernelOnly;
@@ -438,6 +447,14 @@ typedef struct {
         int      cpuInstrFd;
         int      cpuBranchFd;
         int      cpuIptBtsFd;
+        void*    btsModuleShm;
+        int      btsModuleShmFd;
+        uint32_t btsModuleShmCount;
+        size_t   btsModuleRangeCnt;
+        hf_bts_module_range_t btsModuleRanges[_HF_BTS_MODULE_FILTER_MAX];
+        bool     btsModuleFilterReady;
+        bool     btsModuleFilterWarned;
+        bool     btsModuleFilterErrorLogged;
     } arch_linux;
 } run_t;
 

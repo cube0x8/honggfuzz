@@ -32,6 +32,7 @@
 #include <linux/sysctl.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -44,12 +45,138 @@
 #include "libhfcommon/files.h"
 #include "libhfcommon/log.h"
 #include "libhfcommon/util.h"
+#include "bts_modules.h"
 #include "pt.h"
 
 #define _HF_PERF_MAP_SZ (1024 * 512)
 /* PERF_TYPE for Intel_PT/BTS -1 if none */
 static int32_t perfIntelPtPerfType  = -1;
 static int32_t perfIntelBtsPerfType = -1;
+
+static inline bool arch_perfBtsModuleFilterEnabled(const run_t* run) {
+    return run->global->arch_linux.btsModuleNamesCnt != 0U;
+}
+
+static bool arch_perfBtsOpenModulesShm(run_t* run) {
+    if (run->arch_linux.btsModuleShm != NULL) {
+        return true;
+    }
+
+    char name[HF_BTS_MODULES_SHM_NAME_SIZE];
+    int  len = snprintf(name, sizeof(name), "%s%d", HF_BTS_MODULES_SHM_NAME_PREFIX, run->pid);
+    if (len < 0 || (size_t)len >= sizeof(name)) {
+        if (!run->arch_linux.btsModuleFilterErrorLogged) {
+            LOG_W("BTS module SHM name truncated for pid=%d", (int)run->pid);
+            run->arch_linux.btsModuleFilterErrorLogged = true;
+        }
+        return false;
+    }
+
+    int fd = shm_open(name, O_RDONLY, 0);
+    if (fd == -1) {
+        if (errno != ENOENT && !run->arch_linux.btsModuleFilterErrorLogged) {
+            PLOG_W("shm_open('%s', O_RDONLY)", name);
+            run->arch_linux.btsModuleFilterErrorLogged = true;
+        }
+        return false;
+    }
+
+    void* map = mmap(NULL, sizeof(hf_bts_module_shm_t), PROT_READ, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        if (!run->arch_linux.btsModuleFilterErrorLogged) {
+            PLOG_W("mmap(BTS module SHM, pid=%d)", (int)run->pid);
+            run->arch_linux.btsModuleFilterErrorLogged = true;
+        }
+        close(fd);
+        return false;
+    }
+
+    run->arch_linux.btsModuleShm   = map;
+    run->arch_linux.btsModuleShmFd = fd;
+    return true;
+}
+
+static void arch_perfBtsRefreshModulesFilter(run_t* run) {
+    if (!arch_perfBtsModuleFilterEnabled(run)) {
+        return;
+    }
+    if (!arch_perfBtsOpenModulesShm(run)) {
+        return;
+    }
+
+    hf_bts_module_shm_t* shm = (hf_bts_module_shm_t*)run->arch_linux.btsModuleShm;
+    if (ATOMIC_GET(shm->magic) != HF_BTS_MODULES_SHM_MAGIC ||
+        ATOMIC_GET(shm->version) != HF_BTS_MODULES_SHM_VERSION) {
+        if (!run->arch_linux.btsModuleFilterErrorLogged) {
+            LOG_W("Unexpected BTS module SHM header for pid=%d", (int)run->pid);
+            run->arch_linux.btsModuleFilterErrorLogged = true;
+        }
+        return;
+    }
+    if (ATOMIC_GET(shm->ready) == 0U) {
+        return;
+    }
+
+    bool   matched[_HF_BTS_MODULE_FILTER_MAX] = { false };
+    size_t entryCnt                           = ATOMIC_GET(shm->count);
+    if (entryCnt > HF_BTS_MODULES_SHM_MAX_ENTRIES) {
+        entryCnt = HF_BTS_MODULES_SHM_MAX_ENTRIES;
+    }
+    if (run->arch_linux.btsModuleFilterReady &&
+        run->arch_linux.btsModuleShmCount == entryCnt) {
+        return;
+    }
+
+    run->arch_linux.btsModuleRangeCnt = 0;
+    for (size_t entryIdx = 0; entryIdx < entryCnt; entryIdx++) {
+        for (size_t modIdx = 0; modIdx < run->global->arch_linux.btsModuleNamesCnt; modIdx++) {
+            if (strcmp(shm->entries[entryIdx].name, run->global->arch_linux.btsModuleNames[modIdx]) !=
+                0) {
+                continue;
+            }
+            matched[modIdx] = true;
+            if (run->arch_linux.btsModuleRangeCnt >= ARRAYSIZE(run->arch_linux.btsModuleRanges)) {
+                if (!run->arch_linux.btsModuleFilterWarned) {
+                    LOG_W("Too many BTS module ranges for pid=%d, truncating to %u entries",
+                        (int)run->pid, _HF_BTS_MODULE_FILTER_MAX);
+                    run->arch_linux.btsModuleFilterWarned = true;
+                }
+                break;
+            }
+
+            run->arch_linux.btsModuleRanges[run->arch_linux.btsModuleRangeCnt].start =
+                shm->entries[entryIdx].start;
+            run->arch_linux.btsModuleRanges[run->arch_linux.btsModuleRangeCnt].end =
+                shm->entries[entryIdx].end;
+            run->arch_linux.btsModuleRangeCnt++;
+            break;
+        }
+    }
+
+    for (size_t modIdx = 0; modIdx < run->global->arch_linux.btsModuleNamesCnt; modIdx++) {
+        if (!matched[modIdx]) {
+            LOG_W("Requested BTS module '%s' was not exported by pid=%d",
+                run->global->arch_linux.btsModuleNames[modIdx], (int)run->pid);
+        }
+    }
+
+    LOG_I("Loaded %zu BTS filter range(s) for pid=%d", run->arch_linux.btsModuleRangeCnt,
+        (int)run->pid);
+    run->arch_linux.btsModuleShmCount     = (uint32_t)entryCnt;
+    run->arch_linux.btsModuleFilterReady = true;
+}
+
+static inline bool arch_perfBtsEdgeAllowed(const run_t* run, uint64_t from, uint64_t to) {
+    for (size_t i = 0; i < run->arch_linux.btsModuleRangeCnt; i++) {
+        if ((from >= run->arch_linux.btsModuleRanges[i].start &&
+                from < run->arch_linux.btsModuleRanges[i].end) ||
+            (to >= run->arch_linux.btsModuleRanges[i].start &&
+                to < run->arch_linux.btsModuleRanges[i].end)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 #if defined(PERF_ATTR_SIZE_VER5)
 __attribute__((hot)) static inline void arch_perfBtsCount(run_t* run) {
@@ -62,6 +189,9 @@ __attribute__((hot)) static inline void arch_perfBtsCount(run_t* run) {
 
     uint64_t           aux_head = ATOMIC_GET(pem->aux_head);
     struct bts_branch* br       = (struct bts_branch*)run->arch_linux.perfMmapAux;
+    if (arch_perfBtsModuleFilterEnabled(run)) {
+        arch_perfBtsRefreshModulesFilter(run);
+    }
     for (; br < ((struct bts_branch*)(run->arch_linux.perfMmapAux + aux_head)); br++) {
         /*
          * Kernel sometimes reports branches from the kernel (iret), we are not interested in that
@@ -75,6 +205,11 @@ __attribute__((hot)) static inline void arch_perfBtsCount(run_t* run) {
         }
         if (br->from >= run->global->arch_linux.dynamicCutOffAddr ||
             br->to >= run->global->arch_linux.dynamicCutOffAddr) {
+            continue;
+        }
+        if (arch_perfBtsModuleFilterEnabled(run) &&
+            (!run->arch_linux.btsModuleFilterReady ||
+                !arch_perfBtsEdgeAllowed(run, br->from, br->to))) {
             continue;
         }
 
@@ -266,6 +401,20 @@ void arch_perfClose(run_t* run) {
     if (run->global->feedback.dynFileMethod == _HF_DYNFILE_NONE) {
         return;
     }
+
+    if (run->arch_linux.btsModuleShm != NULL) {
+        munmap(run->arch_linux.btsModuleShm, sizeof(hf_bts_module_shm_t));
+        run->arch_linux.btsModuleShm = NULL;
+    }
+    if (run->arch_linux.btsModuleShmFd != -1) {
+        close(run->arch_linux.btsModuleShmFd);
+        run->arch_linux.btsModuleShmFd = -1;
+    }
+    run->arch_linux.btsModuleShmCount        = 0;
+    run->arch_linux.btsModuleRangeCnt        = 0;
+    run->arch_linux.btsModuleFilterReady     = false;
+    run->arch_linux.btsModuleFilterWarned    = false;
+    run->arch_linux.btsModuleFilterErrorLogged = false;
 
     if (run->arch_linux.perfMmapAux != NULL) {
         munmap(run->arch_linux.perfMmapAux, _HF_PERF_AUX_SZ);

@@ -391,11 +391,18 @@ bool arch_archInit(honggfuzz_t* hfuzz) {
 }
 
 bool arch_archThreadInit(run_t* run) {
-    run->arch_linux.perfMmapBuf = NULL;
-    run->arch_linux.perfMmapAux = NULL;
-    run->arch_linux.cpuInstrFd  = -1;
-    run->arch_linux.cpuBranchFd = -1;
-    run->arch_linux.cpuIptBtsFd = -1;
+    run->arch_linux.perfMmapBuf              = NULL;
+    run->arch_linux.perfMmapAux              = NULL;
+    run->arch_linux.cpuInstrFd               = -1;
+    run->arch_linux.cpuBranchFd              = -1;
+    run->arch_linux.cpuIptBtsFd              = -1;
+    run->arch_linux.btsModuleShm             = NULL;
+    run->arch_linux.btsModuleShmFd           = -1;
+    run->arch_linux.btsModuleShmCount        = 0;
+    run->arch_linux.btsModuleRangeCnt        = 0;
+    run->arch_linux.btsModuleFilterReady     = false;
+    run->arch_linux.btsModuleFilterWarned    = false;
+    run->arch_linux.btsModuleFilterErrorLogged = false;
 
     if (prctl(PR_SET_CHILD_SUBREAPER, 1UL, 0UL, 0UL, 0UL) == -1) {
         PLOG_W("prctl(PR_SET_CHILD_SUBREAPER, 1)");

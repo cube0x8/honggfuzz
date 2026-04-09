@@ -55,6 +55,66 @@ struct custom_option {
     const char*   descr;
 };
 
+static bool cmdlineParseBtsModules(honggfuzz_t* hfuzz, const char* modules) {
+    char* input = strdup(modules);
+    if (input == NULL) {
+        PLOG_W("strdup('%s')", modules);
+        return false;
+    }
+    defer {
+        free(input);
+    };
+
+    char* saveptr = NULL;
+    for (char* token = strtok_r(input, ",", &saveptr); token != NULL;
+         token      = strtok_r(NULL, ",", &saveptr)) {
+        while (isspace((unsigned char)*token)) {
+            token++;
+        }
+
+        char* end = token + strlen(token);
+        while (end > token && isspace((unsigned char)end[-1])) {
+            *--end = '\0';
+        }
+
+        if (*token == '\0') {
+            continue;
+        }
+
+        bool duplicate = false;
+        for (size_t i = 0; i < hfuzz->arch_linux.btsModuleNamesCnt; i++) {
+            if (strcasecmp(hfuzz->arch_linux.btsModuleNames[i], token) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+
+        if (hfuzz->arch_linux.btsModuleNamesCnt >= _HF_BTS_MODULE_FILTER_MAX) {
+            LOG_E("Too many module names in --modules (max: %u)", _HF_BTS_MODULE_FILTER_MAX);
+            return false;
+        }
+
+        char*  dst = hfuzz->arch_linux.btsModuleNames[hfuzz->arch_linux.btsModuleNamesCnt];
+        size_t j   = 0;
+        while (token[j] != '\0' && j < (_HF_BTS_MODULE_NAME_MAX - 1U)) {
+            dst[j] = (char)tolower((unsigned char)token[j]);
+            j++;
+        }
+        dst[j] = '\0';
+        hfuzz->arch_linux.btsModuleNamesCnt++;
+    }
+
+    if (hfuzz->arch_linux.btsModuleNamesCnt == 0U) {
+        LOG_E("No valid module names were provided to --modules");
+        return false;
+    }
+
+    return true;
+}
+
 static bool checkFor_FILE_PLACEHOLDER(const char* const* args) {
     for (int x = 0; args[x]; x++) {
         if (strstr(args[x], _HF_FILE_PLACEHOLDER)) {
@@ -126,6 +186,10 @@ static void cmdlineHelp(const char* pname, struct custom_option* opts) {
     LOG_HELP_BOLD("  " PROG_NAME " --linux_perf_branch -- /usr/bin/djpeg " _HF_FILE_PLACEHOLDER);
     LOG_HELP(" As above, maximize unique branches (edges) via Intel BTS:");
     LOG_HELP_BOLD("  " PROG_NAME " --linux_perf_bts_edge -- /usr/bin/djpeg " _HF_FILE_PLACEHOLDER);
+    LOG_HELP(" As above, but count novelty only for a selected set of modules:");
+    LOG_HELP_BOLD(
+        "  " PROG_NAME
+        " --linux_perf_bts_edge --modules cevakrnl.xmd,ceva_emu.cvd -- /path/to/target");
     LOG_HELP(
         " As above, maximize unique code blocks via Intel Processor Trace (requires libipt.so):");
     LOG_HELP_BOLD("  " PROG_NAME " --linux_perf_ipt_block -- /usr/bin/djpeg " _HF_FILE_PLACEHOLDER);
@@ -544,6 +608,8 @@ bool cmdlineParse(int argc, char* argv[], honggfuzz_t* hfuzz) {
         { { "linux_perf_instr", no_argument, NULL, 0x510 }, "Use PERF_COUNT_HW_INSTRUCTIONS perf" },
         { { "linux_perf_branch", no_argument, NULL, 0x511 }, "Use PERF_COUNT_HW_BRANCH_INSTRUCTIONS perf" },
         { { "linux_perf_bts_edge", no_argument, NULL, 0x513 }, "Use Intel BTS to count unique edges" },
+        { { "linux_perf_modules", required_argument, NULL, 0x516 }, "Comma-separated module allowlist for Intel BTS novelty filtering" },
+        { { "modules", required_argument, NULL, 0x516 }, "Comma-separated module allowlist for Intel BTS novelty filtering" },
         { { "linux_perf_ipt_block", no_argument, NULL, 0x514 }, "Use Intel Processor Trace to count unique blocks (requires libipt.so)" },
         { { "linux_perf_kernel_only", no_argument, NULL, 0x515 }, "Gather kernel-only coverage with Intel PT and with Intel BTS" },
         { { "linux_ns_net", required_argument, NULL, 0x0530 }, "Use Linux NET namespace isolation (yes/no/maybe [default:no])" },
@@ -781,6 +847,11 @@ bool cmdlineParse(int argc, char* argv[], honggfuzz_t* hfuzz) {
         case 0x513:
             hfuzz->feedback.dynFileMethod |= _HF_DYNFILE_BTS_EDGE;
             break;
+        case 0x516:
+            if (!cmdlineParseBtsModules(hfuzz, optarg)) {
+                return false;
+            }
+            break;
         case 0x514:
             hfuzz->feedback.dynFileMethod |= _HF_DYNFILE_IPT_BLOCK;
             break;
@@ -840,6 +911,10 @@ bool cmdlineParse(int argc, char* argv[], honggfuzz_t* hfuzz) {
     if (!files_exists(hfuzz->exe.cmdline[0])) {
         LOG_E("Your fuzzed binary '%s' doesn't seem to exist", hfuzz->exe.cmdline[0]);
         return false;
+    }
+    if (hfuzz->arch_linux.btsModuleNamesCnt > 0 &&
+        !(hfuzz->feedback.dynFileMethod & _HF_DYNFILE_BTS_EDGE)) {
+        LOG_W("--modules has effect only together with --linux_perf_bts_edge");
     }
     if (!cmdlineVerify(hfuzz)) {
         return false;
