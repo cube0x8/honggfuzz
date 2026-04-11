@@ -342,6 +342,7 @@ typedef struct {
         const char* reportFile;
         size_t      dynFileIterExpire;
         bool        only_printable;
+        bool        noSplitDryRun;
         bool        minimize;
         bool        switchingToFDM;
     } cfg;

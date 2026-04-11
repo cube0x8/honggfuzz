@@ -818,6 +818,11 @@ static bool input_shouldReadNewFile(run_t* run) {
         return true;
     }
 
+    if (run->global->cfg.noSplitDryRun) {
+        run->staticFileTryMore = false;
+        return true;
+    }
+
     if (!run->staticFileTryMore) {
         run->staticFileTryMore = true;
         /* Start with 4 bytes, increase the size in following iterations */
@@ -843,6 +848,10 @@ bool input_prepareStaticFile(run_t* run, bool rewind, bool needs_mangle) {
             size_t flen;
             if (!input_getNext(run, run->dynfile->path, &flen, /* rewind= */ rewind)) {
                 return false;
+            }
+            if (run->global->cfg.noSplitDryRun &&
+                fuzz_getState(run->global) == _HF_STATE_DYNAMIC_DRY_RUN) {
+                input_setSize(run, HF_MIN(flen, run->global->mutate.maxInputSz));
             }
             if (needs_mangle) {
                 break;
